@@ -1,18 +1,8 @@
 from pathlib import Path
 
-import joblib
-import pandas as pd
+from flask import Flask, flash, jsonify, render_template, request, send_from_directory
 
-from flask import Flask, render_template, request, flash
-from sklearn.model_selection import train_test_split
-
-from filtros import (
-    LoadDatasetFilter,
-    ValidateDatasetFilter,
-    PrepareDataFilter,
-    TrainModelFilter,
-    EvaluateModelFilter
-)
+from services.weather_service import WeatherService
 
 # Configuración de Flask
 app = Flask(
@@ -28,9 +18,13 @@ MODEL_PATH = Path("models/weather_model.joblib")
 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 TARGET = "rain"
+FRONTEND_DIST = Path("frontend/dist")
+weather_service = WeatherService(MODEL_PATH, TARGET)
 
 @app.route("/", methods=["GET"])
 def index():
+    if FRONTEND_DIST.exists():
+        return send_from_directory(FRONTEND_DIST, "index.html")
     return render_template(
         "index.html",
         results=None,
@@ -38,145 +32,93 @@ def index():
         prediction_result=None
     )
 
-@app.route("/train", methods=["POST"])
-def train():
+@app.post("/api/train")
+def train_api():
     uploaded = request.files.get("dataset")
 
+    if uploaded is None or not uploaded.filename:
+        return jsonify({"error": "Selecciona un archivo CSV."}), 400
+
+    if not uploaded.filename.lower().endswith(".csv"):
+        return jsonify({"error": "El archivo debe tener extensión .csv."}), 400
+
+    try:
+        return jsonify(weather_service.train(uploaded.stream))
+
+    except Exception as exc:
+        app.logger.exception("Error durante el entrenamiento")
+        return jsonify({"error": f"No se pudo procesar el dataset: {exc}"}), 422
+
+
+@app.post("/train")
+def train_legacy():
+    """Mantiene compatible la plantilla Jinja durante la transición a React."""
+    uploaded = request.files.get("dataset")
     if uploaded is None or not uploaded.filename:
         flash("Selecciona un archivo CSV.")
         return index()
 
-    if not uploaded.filename.lower().endswith(".csv"):
-        flash("El archivo debe tener extensión .csv.")
-        return index()
-
     try:
-        # Filtro 1: carga del dataset
-        raw = LoadDatasetFilter().run(uploaded.stream)
-
-        # Filtro 2: validación
-        validated = ValidateDatasetFilter(TARGET).run(raw)
-
-        # Filtro 3: preparación de los datos
-        X, y, info = PrepareDataFilter(TARGET).run(validated)
-
-        # Separación de datos de entrenamiento y prueba
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=0.20,
-            random_state=42,
-            stratify=y
-        )
-
-        # Filtro 4: entrenamiento
-        model = TrainModelFilter().run(
-            X_train,
-            y_train,
-            info
-        )
-
-        # Filtro 5: evaluación
-        metrics = EvaluateModelFilter().run(
-            model,
-            X_test,
-            y_test
-        )
-
-        # Guardar modelo y configuración
-        joblib.dump(
-            {
-                "model": model,
-                "features": list(X.columns),
-                "target": info["target"]
-            },
-            MODEL_PATH
-        )
-
-        results = {
-            "rows": len(validated),
-            "features": len(X.columns),
-            "target": info["target"],
-            "class_distribution": {
-                str(key): int(value)
-                for key, value in y.value_counts().items()
-            },
-            "metrics": metrics,
-            "model_path": str(MODEL_PATH)
-        }
-
+        results = weather_service.train(uploaded.stream)
         return render_template(
             "index.html",
-            results=results,
-            prediction_features=list(X.columns),
-            prediction_result=None
+            results={
+                **results,
+                "model_path": str(MODEL_PATH),
+            },
+            prediction_features=[field["name"] for field in results["feature_schema"]],
+            prediction_result=None,
         )
-
     except Exception as exc:
         app.logger.exception("Error durante el entrenamiento")
         flash(f"No se pudo procesar el dataset: {exc}")
         return index()
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    if not MODEL_PATH.exists():
-        flash("Primero entrena un modelo subiendo un dataset.")
-        return index()
+@app.get("/api/model-info")
+def model_info_api():
+    try:
+        return jsonify(weather_service.model_info())
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@app.post("/api/predict")
+def predict_api():
+    payload = request.get_json(silent=True) or {}
 
     try:
-        saved = joblib.load(MODEL_PATH)
+        return jsonify(weather_service.predict(payload))
 
-        features = saved["features"]
-        model = saved["model"]
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("Error durante la predicción")
+        return jsonify({"error": f"No se pudo generar la predicción: {exc}"}), 422
 
-        values = {}
 
-        for feature in features:
-            raw_value = request.form.get(feature, "").strip()
-
-            if raw_value == "":
-                raise ValueError(
-                    f"El campo '{feature}' es obligatorio."
-                )
-
-            # Convertir a número cuando corresponda.
-            try:
-                values[feature] = float(raw_value)
-            except ValueError:
-                values[feature] = raw_value
-
-        sample = pd.DataFrame(
-            [values],
-            columns=features
-        )
-
-        prediction = model.predict(sample)[0]
-
-        probability = None
-
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(sample)[0]
-            probability = round(
-                float(max(probabilities)) * 100,
-                2
-            )
-
-        prediction_result = {
-            "label": str(prediction),
-            "probability": probability
-        }
-
+@app.post("/predict")
+def predict_legacy():
+    """Mantiene compatible el formulario Jinja anterior."""
+    try:
+        result = weather_service.predict(request.form.to_dict())
+        info = weather_service.model_info()
         return render_template(
             "index.html",
             results=None,
-            prediction_features=features,
-            prediction_result=prediction_result
+            prediction_features=[field["name"] for field in info["feature_schema"]],
+            prediction_result=result,
         )
-
     except Exception as exc:
         app.logger.exception("Error durante la predicción")
         flash(f"No se pudo generar la predicción: {exc}")
         return index()
+
+
+@app.get("/assets/<path:filename>")
+def frontend_assets(filename):
+    return send_from_directory(FRONTEND_DIST / "assets", filename)
 
 if __name__ == "__main__":
     app.run(
